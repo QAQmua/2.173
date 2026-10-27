@@ -1,0 +1,100 @@
+name: Build IPA (Direct Release)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-26
+    permissions:
+      contents: write 
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 自动匹配最新 Xcode 26 环境
+        run: |
+          XCODE_APP=$(ls -d /Applications/Xcode_26*.app /Applications/Xcode*.app 2>/dev/null | sort -V | tail -n 1)
+          if [ -n "$XCODE_APP" ]; then
+            echo "正在切换到: $XCODE_APP"
+            sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+          fi
+          xcodebuild -version
+
+      - name: 解压、自动修复代码冲突并编译
+        run: |
+          find . -maxdepth 2 -iname "*.zip" -exec unzip -o -q "{}" \;
+          rm -rf __MACOSX
+          find . -name "._*" -delete
+
+          PKG_FILE=$(find . -name "Package.swift" -not -path "*/.*" -not -path "*/__MACOSX*" | head -n 1)
+          if [ -z "$PKG_FILE" ]; then
+            echo "未找到 Package.swift"
+            exit 1
+          fi
+          ORIG_DIR=$(dirname "$PKG_FILE")
+          mv "$ORIG_DIR" ./CleanApp.swiftpm
+          cd ./CleanApp.swiftpm
+
+          find . -name "Assets.xcassets" | tail -n +2 | while IFS= read -r dup; do rm -rf "$dup"; done
+
+          # 1. 修复 WidgetKoreanSheet.swift 重名冲突
+          find . -name "WidgetKoreanSheet.swift" -exec sed -i '' 's/IOSNativeGroupedCard/KR_IOSNativeGroupedCard/g' {} +
+          find . -name "WidgetKoreanSheet.swift" -exec sed -i '' 's/IOSNativeSubBox/KR_IOSNativeSubBox/g' {} +
+
+          # 2. 修复漏写 @MainActor
+          find . -name "*.swift" -exec sed -i '' 's/^[[:space:]]*override class func register()/@MainActor override class func register()/g' {} +
+
+          # 3. 彻底重写 WidgetFanFolder.swift 的 folderFrontPocket 函数，消除 .background/.overlay 链式重载超时！
+          FAN_FILE=$(find . -name "WidgetFanFolder.swift" | head -n 1)
+          if [ -n "$FAN_FILE" ]; then
+            perl -0777 -i -pe 's/private func folderFrontPocket\(s: CGFloat\) -> some View \{.*?\n    \}/private func folderFrontPocket(s: CGFloat) -> some View {\n        ZStack {\n            CleanFolderFrontShape().fill(Color.white.opacity(0.75))\n            CleanFolderFrontShape().stroke(Color.white.opacity(0.9), lineWidth: 0.8 * s)\n        }\n        .frame(width: 116 * s, height: 50 * s)\n        .shadow(color: Color.black.opacity(0.04), radius: 5 * s, y: 2.5 * s)\n    }/s' "$FAN_FILE"
+            echo "已成功重构 $FAN_FILE 中的 folderFrontPocket 函数"
+          fi
+
+          SCHEME=$(xcodebuild -list 2>/dev/null | sed -n '/Schemes:/,$p' | tail -n +2 | sed '/^[[:space:]]*$/q' | head -n 1 | xargs)
+          if [ -z "$SCHEME" ]; then
+            SCHEME="幼刀"
+          fi
+          echo "准备编译 Scheme: [$SCHEME]"
+
+          set -o pipefail
+          xcodebuild build \
+            -scheme "$SCHEME" \
+            -destination "generic/platform=iOS" \
+            -configuration Release \
+            -derivedDataPath /tmp/youdao_build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            SWIFT_STRICT_CONCURRENCY=minimal 2>&1 | tee /tmp/build.log || {
+              echo "================ 详细编译错误日志 ================"
+              grep -n "error:" /tmp/build.log -B 15 -A 6 || tail -n 80 /tmp/build.log
+              exit 1
+            }
+
+          mkdir -p Payload
+          APP_PATH=$(find /tmp/youdao_build -name "*.app" -type d | head -n 1)
+          if [ -z "$APP_PATH" ]; then
+            echo "未找到 .app 产物"
+            exit 1
+          fi
+          cp -r "$APP_PATH" Payload/
+
+          PLIST_PATH=$(find Payload -maxdepth 2 -name "Info.plist" | head -n 1)
+          plutil -replace CFBundleIdentifier -string "com.youdong.app" "$PLIST_PATH"
+          plutil -replace CFBundleName -string "幼刀" "$PLIST_PATH" || true
+          plutil -replace CFBundleDisplayName -string "幼刀" "$PLIST_PATH" || true
+
+          zip -r -q "$GITHUB_WORKSPACE/You.ipa" Payload
+          echo "IPA 打包成功！"
+
+      - name: 发布直装版 IPA 到 Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "v1.0.${{ github.run_number }}"
+          name: "最新编译直装版 (直接下载 IPA)"
+          files: You.ipa
+          token: ${{ secrets.GITHUB_TOKEN }}
